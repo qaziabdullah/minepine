@@ -1,0 +1,127 @@
+//@version=6
+indicator("Trend + Volume Regime System (DMI-based, HTF-safe)", overlay=true)
+
+// ── Timeframe selection (header must NOT set timeframe when using side-effects)
+tf     = input.timeframe("", "Calculation timeframe (blank = chart)")
+tfUse  = tf == "" ? timeframe.period : tf
+confirmOnClose = input.bool(true, "Confirm signals on bar close (no intrabar)")
+
+// Helper to fetch a series from selected TF
+f_sec(src) => request.security(syminfo.tickerid, tfUse, src, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Helper: CMF computed in the selected TF
+f_cmf(len) =>
+    mfm    = (high - low) != 0 ? ((close - low) - (high - close)) / (high - low) : 0.0
+    mfv    = mfm * volume
+    mfvSum = ta.cum(mfv)    - ta.cum(mfv)[len]
+    volSum = ta.cum(volume) - ta.cum(volume)[len]
+    not na(volSum) and volSum != 0 ? mfvSum / volSum : na
+
+// ── Inputs
+lenFast     = input.int(21,  "Fast EMA")
+lenSlow     = input.int(55,  "Slow EMA")
+lenTrend    = input.int(200, "Trend EMA (filter)")
+diLen       = input.int(17,  "DI Length")
+adxSmooth   = input.int(14,  "ADX Smoothing")
+adxMin      = input.float(18.0, "Min ADX", step=0.1)
+cmfLen      = input.int(20,  "Chaikin Money Flow Length")
+volSmaLen   = input.int(20,  "Volume SMA Length")
+pullbackPct = input.float(0.35, "Pullback depth (0–1)", minval=0.05, maxval=0.9)
+riskATR     = input.int(14,  "ATR SL length")
+riskMultSL  = input.float(2.0, "ATR Stop x")
+riskMultTP  = input.float(3.0, "ATR Take Profit x")
+showStops   = input.bool(true, "Show SL/TP lines")
+colorBars   = input.bool(true, "Color bars on signals")
+useHTFAtr   = input.bool(false, "Use ATR from selected timeframe")
+showOnCandle = input.bool(true, "Draw BUY/SELL labels on candles")
+
+// ── Pull OHLCV from selected timeframe
+c = f_sec(close)
+h = f_sec(high)
+l = f_sec(low)
+v = f_sec(volume)
+
+// ── EMAs (on selected TF)
+emaFast  = ta.ema(c, lenFast)
+emaSlow  = ta.ema(c, lenSlow)
+emaTrend = ta.ema(c, lenTrend)
+
+// ── DMI/ADX (fetch each component via security)
+[diplus_src, diminus_src, adx_src] = ta.dmi(diLen, adxSmooth)
+diplus  = f_sec(diplus_src)
+diminus = f_sec(diminus_src)
+adx     = f_sec(adx_src)
+
+// ── CMF & Volume SMA (on selected TF)
+cmf    = f_sec(f_cmf(cmfLen))
+volSma = f_sec(ta.sma(volume, volSmaLen))
+
+// ── Regimes & confirmation
+upTrend  = c > emaTrend and emaFast > emaSlow and diplus > diminus
+dnTrend  = c < emaTrend and emaFast < emaSlow and diminus > diplus
+trendOK  = adx > adxMin
+volBoost = not na(volSma) and v > volSma * 1.1
+flowUp   = not na(cmf) and cmf > 0
+flowDn   = not na(cmf) and cmf < 0
+
+// ── Pullback logic (evaluated on selected TF values)
+pbUp = upTrend and trendOK and flowUp and volBoost and (l <= emaFast + (emaSlow - emaFast) * pullbackPct)
+pbDn = dnTrend and trendOK and flowDn and volBoost and (h >= emaFast - (emaFast - emaSlow) * pullbackPct)
+
+// ── Base signals
+crossUp   = ta.crossover(emaFast, emaSlow)
+crossDown = ta.crossunder(emaFast, emaSlow)
+rawLong   = (crossUp and upTrend and trendOK and flowUp and volBoost) or pbUp
+rawShort  = (crossDown and dnTrend and trendOK and flowDn and volBoost) or pbDn
+
+// Optionally require bar close confirmation to avoid intrabar repaint feel
+longSig  = confirmOnClose ? (rawLong  and barstate.isconfirmed) : rawLong
+shortSig = confirmOnClose ? (rawShort and barstate.isconfirmed) : rawShort
+
+// ── Plots (EMAs)
+plot(emaFast,  "EMA Fast",  color=color.new(color.teal,   0))
+plot(emaSlow,  "EMA Slow",  color=color.new(color.orange, 0))
+plot(emaTrend, "EMA Trend", color=color.new(color.purple, 0), linewidth=2)
+
+// ── Candle labels (on-chart)
+if showOnCandle and longSig
+    label.new(bar_index, low, "BUY", style=label.style_label_up, textcolor=color.white, color=color.new(color.green, 0), size=size.small)
+
+if showOnCandle and shortSig
+    label.new(bar_index, high, "SELL", style=label.style_label_down, textcolor=color.white, color=color.new(color.red, 0), size=size.small)
+
+// Optional: color bars on signal bars
+barcolor(colorBars ? (longSig ? color.new(color.green, 0) : shortSig ? color.new(color.red, 0) : na) : na)
+
+// ── Risk model (visual only)
+atr_src = ta.atr(riskATR)
+atr     = useHTFAtr ? f_sec(atr_src) : atr_src
+longSL  = longSig  ? l - atr * riskMultSL  : na
+longTP  = longSig  ? c + atr * riskMultTP  : na
+shortSL = shortSig ? h + atr * riskMultSL  : na
+shortTP = shortSig ? c - atr * riskMultTP  : na
+
+var line longSLln  = na
+var line longTPln  = na
+var line shortSLln = na
+var line shortTPln = na
+
+if showStops and longSig
+    if not na(longSLln)
+        line.delete(longSLln)
+    if not na(longTPln)
+        line.delete(longTPln)
+    longSLln := line.new(bar_index, longSL, bar_index + 50, longSL, extend=extend.right, color=color.new(color.red, 30))
+    longTPln := line.new(bar_index, longTP, bar_index + 50, longTP, extend=extend.right, color=color.new(color.green, 30))
+
+if showStops and shortSig
+    if not na(shortSLln)
+        line.delete(shortSLln)
+    if not na(shortTPln)
+        line.delete(shortTPln)
+    shortSLln := line.new(bar_index, shortSL, bar_index + 50, shortSL, extend=extend.right, color=color.new(color.red, 30))
+    shortTPln := line.new(bar_index, shortTP, bar_index + 50, shortTP, extend=extend.right, color=color.new(color.green, 30))
+
+// ── Alerts
+alertcondition(longSig,  title="BUY",  message="Trend+Volume BUY (DMI+CMF confirmed)")
+alertcondition(shortSig, title="SELL", message="Trend+Volume SELL (DMI+CMF confirmed)")
