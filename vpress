@@ -1,0 +1,84 @@
+//@version=5
+// This indicator combines Moving Averages for trend, Chaikin Money Flow (CMF) for volume pressure,
+// and a volume filter to generate buy and sell signals.
+indicator("Trend + Volume Flow System", overlay=true)
+
+// === Inputs ===
+// Moving Average inputs for trend detection
+lenFast    = input.int(21, "Fast EMA Length")
+lenSlow    = input.int(55, "Slow EMA Length")
+lenTrend   = input.int(200, "Trend EMA Length")
+
+// CMF and Volume inputs
+cmfLen     = input.int(20, "Chaikin Money Flow Length")
+volSmaLen  = input.int(20, "Volume SMA Length")
+
+// Signal Confirmation inputs
+minVolMult = input.float(1.1, "Min Volume Multiplier", minval=1.0)
+minCmf     = input.float(0.0, "Min CMF for Flow Confirmation")
+
+// === Indicator Calculations ===
+// Exponential Moving Averages for overall trend direction
+emaFast  = ta.ema(close, lenFast)
+emaSlow  = ta.ema(close, lenSlow)
+emaTrend = ta.ema(close, lenTrend)
+
+// --- Manual CMF Calculation ---
+// 1. Calculate the Money Flow Multiplier (MFM)
+mfm = (high - low) != 0 ? ((close - low) - (high - close)) / (high - low) : 0.0
+
+// 2. Calculate the Money Flow Volume (MFV)
+mfv = mfm * volume
+
+// 3. Calculate CMF by summing MFV and Volume over the lookback period
+mfvSum = ta.cum(mfv) - ta.cum(mfv)[cmfLen]
+volSum = ta.cum(volume) - ta.cum(volume)[cmfLen]
+cmf = volSum != 0 ? mfvSum / volSum : 0
+// ------------------------------
+
+// Simple Moving Average of the volume to detect above-average volume periods.
+volSma = ta.sma(volume, volSmaLen)
+
+// === Trend and Confirmation Conditions ===
+// Define the conditions for an uptrend.
+// The fast EMA must be above the slow EMA, and the price must be above the long-term trend EMA.
+isUptrend = emaFast > emaSlow and close > emaTrend
+
+// Define the conditions for a downtrend.
+// The fast EMA must be below the slow EMA, and the price must be below the long-term trend EMA.
+isDowntrend = emaFast < emaSlow and close < emaTrend
+
+// Volume Confirmation: Check if the current volume is significantly higher than its average.
+// This helps to confirm a strong move and filter out weak signals.
+isVolConfirm = volume > volSma * minVolMult
+
+// Chaikin Money Flow Confirmation: Check if the money flow supports the trend.
+// For a buy signal, CMF must be positive (accumulation).
+// For a sell signal, CMF must be negative (distribution).
+isFlowConfirmUp = cmf > minCmf
+isFlowConfirmDn = cmf < -minCmf
+
+// === Signal Generation ===
+// A long signal is generated when the fast EMA crosses over the slow EMA,
+// a strong trend is present, volume is confirmed, and money flow is positive.
+longSignal = ta.crossover(emaFast, emaSlow) and isUptrend and isVolConfirm and isFlowConfirmUp
+
+// A short signal is generated when the fast EMA crosses under the slow EMA,
+// a strong trend is present, volume is confirmed, and money flow is negative.
+shortSignal = ta.crossunder(emaFast, emaSlow) and isDowntrend and isVolConfirm and isFlowConfirmDn
+
+// === Plotting ===
+// Plot the EMAs on the chart for visual trend analysis.
+plot(emaFast, "Fast EMA", color=color.new(color.blue, 0), linewidth=2)
+plot(emaSlow, "Slow EMA", color=color.new(color.orange, 0), linewidth=2)
+plot(emaTrend, "Trend EMA", color=color.new(color.purple, 0), linewidth=3)
+
+// Plot the buy and sell signals on the chart.
+// The size has been changed from size.tiny to size.normal to make the markers more visible.
+plotshape(longSignal, title="Buy Signal", style=shape.triangleup, location=location.belowbar, color=color.new(color.green, 0), size=size.normal)
+plotshape(shortSignal, title="Sell Signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.normal)
+
+// === Alerts ===
+// Create alerts so you can be notified when a signal is generated.
+alertcondition(longSignal, title="Buy Signal", message="A confirmed buy signal has been generated.")
+alertcondition(shortSignal, title="Sell Signal", message="A confirmed sell signal has been generated.")
