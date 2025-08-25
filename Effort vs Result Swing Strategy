@@ -1,0 +1,367 @@
+//@version=6
+strategy("Effort vs Result Swing Strategy (Boxes + Trendline + Projection + Triggers)",
+     overlay=true, max_labels_count=500, max_lines_count=300, max_boxes_count=220,
+     initial_capital=100000, pyramiding=0, calc_on_order_fills=true, calc_on_every_tick=false)
+
+//============================== Inputs
+leftBars   = input.int(3,  "Pivot Left", minval=1)
+rightBars  = input.int(3,  "Pivot Right", minval=1)
+emaLen     = input.int(55, "Trend EMA Length", minval=5)
+emaSlopeLB = input.int(3,  "EMA Slope Lookback", minval=1)
+
+useVolume  = input.bool(true, "Weight Effort by Volume (fallback to 1 if 0)")
+effSource  = input.string("TrueRange", "Candle Length", options=["TrueRange","High-Low","Body"])
+effPower   = input.float(1.0, "Length Exponent (effort = length^p * vol)", minval=0.1, step=0.1)
+
+pullEffMaxRatio = input.float(0.7, "Pullback Effort / Impulse Effort ≤", minval=0.05, maxval=2.0, step=0.05)
+minLegBars      = input.int(3, "Minimum Bars per Leg", minval=1)
+confirmBreakout = input.bool(true, "Require Swing-Breakout Entry (safer)")
+
+// Risk / Targets
+useSwingStop = input.bool(true, "Stop at Last Swing (else ATR)")
+atrLen       = input.int(14, "ATR Length", minval=1)
+atrMultSL    = input.float(1.5, "ATR Stop Mult", minval=0.1, step=0.1)
+tpMoveMult   = input.float(1.0, "TP = Prev Impulse Price Move ×", minval=0.25, step=0.25)
+
+// Drawing
+showBoxes       = input.bool(true, "Draw Effort Boxes")
+showTrendLines  = input.bool(true, "Draw Trendlines (connect swings)")
+showLegLabels   = input.bool(true, "Label Effort per Leg")
+boxAlpha        = input.int(85, "Box Transparency (0=solid)", minval=0, maxval=100)
+
+// Projection controls & dashboard
+showProjection  = input.bool(true,  "Show Dynamic Projection on Last Candle")
+projBasis       = input.string("Effort", "Projection Basis", options=["Effort","RawVolume"])
+projMult        = input.float(1.0, "Projection Strength Multiplier", minval=0.1, step=0.1)
+clipRatioAbs    = input.float(2.0, "Max |Remaining Ratio| (clamp)", minval=0.1, step=0.1)
+showDashboard   = input.bool(true,  "Show Top-Right Dashboard")
+
+//============================== Helper (pure)
+lengthBar() =>
+    effSource == "TrueRange" ? ta.tr(true) :    effSource == "High-Low"  ? (high - low) :    math.abs(close - open)
+
+volW() =>
+    useVolume ? (volume > 0 ? volume : 1.0) : 1.0
+
+effortBar = math.pow(math.max(lengthBar(), 0.0000001), effPower) * volW()
+
+ema     = ta.ema(close, emaLen)
+slopeUp = ema > ema[emaSlopeLB]
+slopeDn = ema < ema[emaSlopeLB]
+atr     = ta.atr(atrLen)
+
+//============================== Pivots & Swing Prices
+pl = ta.pivotlow(low,  leftBars, rightBars)
+ph = ta.pivothigh(high, leftBars, rightBars)
+
+pivotLowConfirmed  = not na(pl)
+pivotHighConfirmed = not na(ph)
+
+pivotLowIdx  = bar_index - rightBars
+pivotHighIdx = bar_index - rightBars
+
+pivotLowPrice  = ta.valuewhen(pivotLowConfirmed,  low[rightBars],  0)
+pivotHighPrice = ta.valuewhen(pivotHighConfirmed, high[rightBars], 0)
+
+//============================== Leg state (globals; mutate only outside functions)
+var int   legDir        = 0      // +1 up leg, -1 down leg, 0 none
+var float legEffort     = 0.0
+var float legVolSum     = 0.0
+var int   legBarsCount  = 0
+var int   legStartIdx   = na
+var float legStartPrice = na
+
+// Storage for completed legs and drawings
+var int[]   dirArr   = array.new_int()
+var int[]   sIdxArr  = array.new_int()
+var int[]   eIdxArr  = array.new_int()
+var float[] sPxArr   = array.new_float()
+var float[] ePxArr   = array.new_float()
+var float[] effArr   = array.new_float()
+var float[] volArr   = array.new_float()
+var box[]   boxArr   = array.new_box()
+var line[]  lineArr  = array.new_line()
+
+// Trigger line handles (global so they persist)
+var line longTrig  = na
+var line shortTrig = na
+
+//============================== Accumulate current leg
+if legDir != 0
+    legEffort    += effortBar
+    legVolSum    += volume
+    legBarsCount += 1
+
+//============================== Start first leg when first pivot appears
+if na(legStartIdx) and pivotLowConfirmed
+    legDir        := +1
+    legStartIdx   := pivotLowIdx
+    legStartPrice := pivotLowPrice
+    legEffort     := 0.0
+    legVolSum     := 0.0
+    legBarsCount  := 0
+else if na(legStartIdx) and pivotHighConfirmed
+    legDir        := -1
+    legStartIdx   := pivotHighIdx
+    legStartPrice := pivotHighPrice
+    legEffort     := 0.0
+    legVolSum     := 0.0
+    legBarsCount  := 0
+
+//============================== Finalize legs on new pivot confirmations (pure; returns tuple)
+finalizeAndStore(_endIdx, _endPrice) =>
+    _pushDir  = legDir
+    _pushSIdx = legStartIdx
+    _pushEIdx = _endIdx
+    _pushSPx  = legStartPrice
+    _pushEPx  = _endPrice
+    _pushEff  = math.max(legEffort, 0.0)
+    _pushVol  = math.max(legVolSum, 0.0)
+    [_pushDir, _pushSIdx, _pushEIdx, _pushSPx, _pushEPx, _pushEff, _pushVol]
+
+// ---- UP leg completes on pivot high
+if pivotHighConfirmed and legDir == +1 and legBarsCount >= minLegBars
+    [pd, psIdx, peIdx, psPx, pePx, pEff, pVol] = finalizeAndStore(pivotHighIdx, pivotHighPrice)
+    array.push(dirArr,  pd)
+    array.push(sIdxArr, psIdx)
+    array.push(eIdxArr, peIdx)
+    array.push(sPxArr,  psPx)
+    array.push(ePxArr,  pePx)
+    array.push(effArr,  pEff)
+    array.push(volArr,  pVol)
+
+    if showBoxes
+        top  = math.max(psPx, pePx)
+        bot  = math.min(psPx, pePx)
+        bclr = pd == 1 ? color.new(color.teal, boxAlpha) : color.new(color.red, boxAlpha)
+        b    = box.new(psIdx, top, peIdx, bot, bgcolor=bclr, border_color=color.new(color.gray, 70))
+        if showLegLabels
+            box.set_text(b, "Leg " + (pd==1 ? "↑" : "↓") + "\nEffort: " + str.tostring(pEff))
+        array.push(boxArr, b)
+
+    if showTrendLines and array.size(eIdxArr) >= 2
+        i2 = array.size(eIdxArr)-1
+        i1 = array.size(eIdxArr)-2
+        ln = line.new(x1=array.get(eIdxArr, i1), y1=array.get(ePxArr, i1),
+                      x2=array.get(eIdxArr, i2), y2=array.get(ePxArr, i2),
+                      extend=extend.none, width=2,
+                      color=pd==1 ? color.new(color.teal, 0) : color.new(color.red, 0))
+        array.push(lineArr, ln)
+
+    // Reset + start new DOWN leg
+    legDir        := -1
+    legStartIdx   := pivotHighIdx
+    legStartPrice := pivotHighPrice
+    legEffort     := 0.0
+    legVolSum     := 0.0
+    legBarsCount  := 0
+
+// ---- DOWN leg completes on pivot low
+if pivotLowConfirmed and legDir == -1 and legBarsCount >= minLegBars
+    [pd, psIdx, peIdx, psPx, pePx, pEff, pVol] = finalizeAndStore(pivotLowIdx, pivotLowPrice)
+    array.push(dirArr,  pd)
+    array.push(sIdxArr, psIdx)
+    array.push(eIdxArr, peIdx)
+    array.push(sPxArr,  psPx)
+    array.push(ePxArr,  pePx)
+    array.push(effArr,  pEff)
+    array.push(volArr,  pVol)
+
+    if showBoxes
+        top  = math.max(psPx, pePx)
+        bot  = math.min(psPx, pePx)
+        bclr = pd == 1 ? color.new(color.teal, boxAlpha) : color.new(color.red, boxAlpha)
+        b    = box.new(psIdx, top, peIdx, bot, bgcolor=bclr, border_color=color.new(color.gray, 70))
+        if showLegLabels
+            box.set_text(b, "Leg " + (pd==1 ? "↑" : "↓") + "\nEffort: " + str.tostring(pEff))
+        array.push(boxArr, b)
+
+    if showTrendLines and array.size(eIdxArr) >= 2
+        i2 = array.size(eIdxArr)-1
+        i1 = array.size(eIdxArr)-2
+        ln = line.new(x1=array.get(eIdxArr, i1), y1=array.get(ePxArr, i1),
+                      x2=array.get(eIdxArr, i2), y2=array.get(ePxArr, i2),
+                      extend=extend.none, width=2,
+                      color=pd==1 ? color.new(color.teal, 0) : color.new(color.red, 0))
+        array.push(lineArr, ln)
+
+    // Reset + start new UP leg
+    legDir        := +1
+    legStartIdx   := pivotLowIdx
+    legStartPrice := pivotLowPrice
+    legEffort     := 0.0
+    legVolSum     := 0.0
+    legBarsCount  := 0
+
+//============================== Trim stored legs/drawings (keep last 40)
+while array.size(dirArr) > 40
+    array.shift(dirArr)
+    array.shift(sIdxArr)
+    array.shift(eIdxArr)
+    array.shift(sPxArr)
+    array.shift(ePxArr)
+    array.shift(effArr)
+    array.shift(volArr)
+    if showBoxes and array.size(boxArr) > 0
+        b = array.shift(boxArr)
+        box.delete(b)
+    if showTrendLines and array.size(lineArr) > 0
+        ln = array.shift(lineArr)
+        line.delete(ln)
+
+//============================== Trading Logic (Effort vs Result)
+legsReady = array.size(dirArr) >= 2
+var float lastEntryPrice = na
+
+// signals stored as series so we can plot in global scope
+var bool longEnterSig  = false
+var bool shortEnterSig = false
+longEnterSig  := false
+shortEnterSig := false
+
+if legsReady
+    idx2 = array.size(dirArr) - 1    // most recent completed leg (pullback)
+    idx1 = array.size(dirArr) - 2    // prior completed leg (impulse)
+
+    dir1   = array.get(dirArr, idx1)
+    dir2   = array.get(dirArr, idx2)
+    sPx2   = array.get(sPxArr, idx2)
+    ePx2   = array.get(ePxArr, idx2)
+    eff1   = array.get(effArr, idx1)
+    eff2   = array.get(effArr, idx2)
+    sPx1   = array.get(sPxArr, idx1)
+    ePx1   = array.get(ePxArr, idx1)
+
+    move1  = math.abs(ePx1 - sPx1)   // impulse price distance
+
+    // -------- LONG CONTINUATION
+    longSetup   = dir1 == +1 and dir2 == -1 and slopeUp
+    longEffOkay = eff2 / math.max(eff1, 1e-9) <= pullEffMaxRatio
+    longBreak   = close > sPx2
+    longEnter   = longSetup and longEffOkay and (confirmBreakout ? longBreak : true)
+
+    longStopPx  = useSwingStop ? ePx2 - syminfo.mintick : close - atrMultSL * atr
+    longLimitPx = longEnter ? close + move1 * tpMoveMult : na
+
+    // -------- SHORT CONTINUATION
+    shortSetup   = dir1 == -1 and dir2 == +1 and slopeDn
+    shortEffOkay = eff2 / math.max(eff1, 1e-9) <= pullEffMaxRatio
+    shortBreak   = close < sPx2
+    shortEnter   = shortSetup and shortEffOkay and (confirmBreakout ? shortBreak : true)
+
+    shortStopPx  = useSwingStop ? ePx2 + syminfo.mintick : close + atrMultSL * atr
+    shortLimitPx = shortEnter ? close - move1 * tpMoveMult : na
+
+    // Entries (one position at a time)
+    if longEnter and strategy.position_size <= 0
+        strategy.entry("Long", strategy.long)
+        lastEntryPrice := close
+        strategy.exit("Long-Exit", from_entry="Long", stop=longStopPx, limit=longLimitPx)
+        longEnterSig := true
+
+    if shortEnter and strategy.position_size >= 0
+        strategy.entry("Short", strategy.short)
+        lastEntryPrice := close
+        strategy.exit("Short-Exit", from_entry="Short", stop=shortStopPx, limit=shortLimitPx)
+        shortEnterSig := true
+
+    // -------- Trigger lines that extend right (derive level from arrays)
+    lastDir       = array.get(dirArr,  array.size(dirArr)-1)   // last completed leg (pullback)
+    pullbackStart = array.get(sPxArr,  array.size(sPxArr)-1)   // breakout level
+
+    // Long trigger (break above prior swing high)
+    if lastDir == -1
+        if na(longTrig)
+            longTrig := line.new(bar_index, pullbackStart, bar_index+1, pullbackStart,
+                                  extend=extend.right, color=color.teal, width=2, style=line.style_dotted)
+        else
+            line.set_y1(longTrig, pullbackStart), line.set_y2(longTrig, pullbackStart)
+            line.set_x1(longTrig, bar_index),     line.set_x2(longTrig, bar_index+1)
+    else
+        if not na(longTrig)
+            line.delete(longTrig), longTrig := na
+
+    // Short trigger (break below prior swing low)
+    if lastDir == +1
+        if na(shortTrig)
+            shortTrig := line.new(bar_index, pullbackStart, bar_index+1, pullbackStart,
+                                   extend=extend.right, color=color.red, width=2, style=line.style_dotted)
+        else
+            line.set_y1(shortTrig, pullbackStart), line.set_y2(shortTrig, pullbackStart)
+            line.set_x1(shortTrig, bar_index),     line.set_x2(shortTrig, bar_index+1)
+    else
+        if not na(shortTrig)
+            line.delete(shortTrig), shortTrig := na
+
+//============================== Dynamic projection on the latest candle
+var line projLine = na
+var table dash    = na
+
+havePrevAndCurr = array.size(dirArr) >= 1 and legDir != 0
+
+idxPrev      = array.size(dirArr) - 1
+prevEff      = havePrevAndCurr ? array.get(effArr, idxPrev) : na
+prevVol      = havePrevAndCurr ? array.get(volArr, idxPrev) : na
+prevDir      = havePrevAndCurr ? array.get(dirArr, idxPrev) : 0
+prevMoveAbs  = havePrevAndCurr ? math.abs(array.get(ePxArr, idxPrev) - array.get(sPxArr, idxPrev)) : na
+
+basisPrev    = projBasis == "Effort" ? prevEff   : prevVol
+basisCurr    = projBasis == "Effort" ? legEffort : legVolSum
+
+ratioRaw     = havePrevAndCurr and basisPrev > 0 ? (basisPrev - basisCurr) / basisPrev : na
+ratioClamped = na(ratioRaw) ? na : math.max(-clipRatioAbs, math.min(clipRatioAbs, ratioRaw))
+
+projDist     = havePrevAndCurr and not na(ratioClamped) and not na(prevMoveAbs) ? projMult * ratioClamped * prevMoveAbs * prevDir : na
+targetPrice  = havePrevAndCurr and not na(projDist) ? close + projDist : na
+
+if showProjection and havePrevAndCurr and not na(targetPrice)
+    projColor = targetPrice >= close ? color.new(color.teal, 0) : color.new(color.red, 0)
+    if na(projLine)
+        projLine := line.new(bar_index, close, bar_index, targetPrice, width=2, color=projColor, extend=extend.none)
+    else
+        line.set_x1(projLine, bar_index)
+        line.set_y1(projLine, close)
+        line.set_x2(projLine, bar_index)
+        line.set_y2(projLine, targetPrice)
+        line.set_color(projLine, projColor)
+else
+    if not na(projLine)
+        line.delete(projLine), projLine := na
+
+//============================== Top-right dashboard (remaining volume/effort + target)
+if showDashboard
+    if na(dash)
+        dash := table.new(position.top_right, 1, 3, frame_color=color.new(color.gray, 60), border_width=1)
+    remVolRaw    = havePrevAndCurr ? (prevVol - legVolSum) : na
+    remVolSigned = havePrevAndCurr ? remVolRaw * prevDir : na
+    txtVol       = havePrevAndCurr ? "Remaining Vol: " + str.tostring(remVolSigned) : "Remaining Vol: n/a"
+    table.cell(dash, 0, 0, txtVol,  text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    remEffRaw    = havePrevAndCurr ? (prevEff - legEffort) : na
+    remEffSigned = havePrevAndCurr ? remEffRaw * prevDir : na
+    txtEff       = havePrevAndCurr ? "Remaining Eff: " + str.tostring(remEffSigned) : "Remaining Eff: n/a"
+    table.cell(dash, 0, 1, txtEff,  text_color=color.white, bgcolor=color.new(color.black, 0))
+
+    txtTgt       = havePrevAndCurr and not na(targetPrice) ? "Proj Target: " + str.tostring(targetPrice, format.price) : "Proj Target: n/a"
+    table.cell(dash, 0, 2, txtTgt,  text_color=color.white, bgcolor=color.new(color.black, 0))
+
+//============================== Visuals
+plot(ema, "EMA Trend", color=color.new(color.orange, 0), linewidth=2)
+plotshape(pivotLowConfirmed,  title="Pivot Low",  style=shape.triangleup,   color=color.new(color.teal, 0), location=location.belowbar, size=size.tiny, text="PL")
+plotshape(pivotHighConfirmed, title="Pivot High", style=shape.triangledown, color=color.new(color.red, 0),  location=location.abovebar, size=size.tiny, text="PH")
+
+// Show breakout levels for latest completed pullback
+plot(confirmBreakout and legsReady and array.get(dirArr, array.size(dirArr)-1) == -1 ? array.get(sPxArr, array.size(sPxArr)-1) : na,
+     title="Long Breakout Level (prior swing high)", style=plot.style_linebr, color=color.new(color.teal, 0))
+plot(confirmBreakout and legsReady and array.get(dirArr, array.size(dirArr)-1) == +1 ? array.get(sPxArr, array.size(sPxArr)-1) : na,
+     title="Short Breakout Level (prior swing low)",  style=plot.style_linebr, color=color.new(color.red, 0))
+
+// Entry markers (now in GLOBAL SCOPE)
+plotshape(longEnterSig,  title="BUY",  style=shape.labelup,   text="BUY",  color=color.teal, location=location.belowbar, size=size.small)
+plotshape(shortEnterSig, title="SELL", style=shape.labeldown, text="SELL", color=color.red,  location=location.abovebar, size=size.small)
+
+// Alerts
+alertcondition(legsReady and (close > array.get(sPxArr, array.size(sPxArr)-1)) and (array.get(dirArr, array.size(dirArr)-2)==+1 and array.get(dirArr, array.size(dirArr)-1)==-1) and slopeUp,
+   title="Long Continuation Alert", message="Effort/Result long continuation setup.")
+alertcondition(legsReady and (close < array.get(sPxArr, array.size(sPxArr)-1)) and (array.get(dirArr, array.size(dirArr)-2)==-1 and array.get(dirArr, array.size(dirArr)-1)==+1) and slopeDn,
+   title="Short Continuation Alert", message="Effort/Result short continuation setup.")
