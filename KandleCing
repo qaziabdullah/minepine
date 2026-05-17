@@ -1,0 +1,509 @@
+// ============================================================
+// ICT / SMC Institutional Flow — Supply & Demand + Flush Engine
+// Pine Script v5  |  © 2025  |  Inner Circle Trader Concepts
+// ============================================================
+//@version=5
+indicator(title  = "ICT SMC — Institutional Flow [Supply/Demand + Flush]",
+          shorttitle = "ICT·SMC·Flow",
+          overlay    = true,
+          max_boxes_count  = 200,
+          max_labels_count = 200,
+          max_lines_count  = 200)
+
+// ─────────────────────────────────────────────────────────────
+// §1  USER INPUTS
+// ─────────────────────────────────────────────────────────────
+grp_struct  = "── Market Structure ──"
+grp_zone    = "── Zone Settings ──"
+grp_flush   = "── Flush Mechanics ──"
+grp_entry   = "── Entry & Confirmation ──"
+grp_risk    = "── Risk Management ──"
+grp_visual  = "── Visuals ──"
+
+// Market Structure
+i_swingLen      = input.int   (5,    "Swing Lookback (bars)",    minval=3, maxval=50, group=grp_struct)
+i_dispFactor    = input.float (1.5,  "Displacement ATR Factor",  minval=0.5, step=0.1, group=grp_struct,
+                               tooltip="Multiplier applied to ATR to classify a move as 'aggressive displacement'.")
+
+// Zone Settings
+i_zoneBuffer    = input.float (0.1,  "Zone Buffer (% of range)", minval=0.0, maxval=5.0, step=0.05, group=grp_zone,
+                               tooltip="Adds a small buffer to zone high/low so wicks touching the edge still register.")
+i_maxZones      = input.int   (5,    "Max Active Zones Per Side", minval=1, maxval=10, group=grp_zone)
+i_fvgMinSize    = input.float (0.3,  "FVG Minimum Size (ATR×)",  minval=0.0, step=0.05, group=grp_zone,
+                               tooltip="Imbalance filter: the FVG gap must be at least this multiple of ATR to validate a zone.")
+
+// Flush Mechanics
+i_flushWick     = input.float (0.3,  "Min Wick-to-Range Ratio",  minval=0.05, step=0.05, group=grp_flush,
+                               tooltip="The flush wick must be at least this fraction of the total candle range to qualify.")
+
+// Entry Confirmation
+i_confirmBars   = input.int   (3,    "Confirmation Window (bars)", minval=1, maxval=5, group=grp_entry)
+i_engulfFactor  = input.float (0.6,  "Engulf Body Ratio",          minval=0.3, step=0.05, group=grp_entry,
+                               tooltip="Entry candle body must cover at least this fraction of the prior candle's body.")
+
+// Risk Management
+i_rrRatio       = input.float (2.0,  "Risk-to-Reward Ratio",      minval=0.5, step=0.5, group=grp_risk)
+i_useOppZone    = input.bool  (false, "TP at Opposing Zone",       group=grp_risk,
+                               tooltip="If enabled, Take-Profit targets the nearest unmitigated opposing zone instead of fixed RR.")
+
+// Visuals
+i_showDemand    = input.bool  (true,  "Show Demand Zones",   group=grp_visual)
+i_showSupply    = input.bool  (true,  "Show Supply Zones",   group=grp_visual)
+i_showSL        = input.bool  (true,  "Show Stop Loss Lines",group=grp_visual)
+i_showTP        = input.bool  (true,  "Show Take Profit Lines", group=grp_visual)
+i_showFVG       = input.bool  (false, "Show FVG Highlights", group=grp_visual)
+i_demandColor   = input.color (color.new(#00C4FF, 80), "Demand Zone Color", group=grp_visual)
+i_supplyColor   = input.color (color.new(#FF3B6B, 80), "Supply Zone Color", group=grp_visual)
+
+// ─────────────────────────────────────────────────────────────
+// §2  CORE CALCULATIONS
+// ─────────────────────────────────────────────────────────────
+atr14 = ta.atr(14)
+
+// ── 2a  Swing High / Low detection (no-repaint: confirmed bars) ──
+swingHigh = ta.pivothigh(high, i_swingLen, i_swingLen)
+swingLow  = ta.pivotlow (low,  i_swingLen, i_swingLen)
+
+// Track most recent confirmed swing levels
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+
+if not na(swingHigh)
+    lastSwingHigh := swingHigh
+if not na(swingLow)
+    lastSwingLow  := swingLow
+
+// ── 2b  Displacement classifier ──
+// A candle is "aggressively bullish" if its body + close > prior bar's high
+// AND its range exceeds ATR × factor
+isBullDisplace = close > close[1] and (high - low) > atr14 * i_dispFactor and close > high[1]
+isBearDisplace = close < close[1] and (high - low) > atr14 * i_dispFactor and close < low[1]
+
+// ── 2c  BOS (Break of Structure) detection ──
+// Bullish BOS: current close breaks above last confirmed swing high
+// Bearish BOS: current close breaks below last confirmed swing low
+bullBOS = not na(lastSwingHigh) and close > lastSwingHigh and isBullDisplace
+bearBOS = not na(lastSwingLow)  and close < lastSwingLow  and isBearDisplace
+
+// ── 2d  Fair Value Gap (FVG) check ──
+// Bullish FVG: low[0] > high[2]  (gap between candle-2 high and candle-0 low)
+// Bearish FVG: high[0] < low[2]
+bullFVGSize = low  - high[2]   // positive when gap exists
+bearFVGSize = low[2] - high     // positive when gap exists
+
+hasBullFVG = bullFVGSize > atr14 * i_fvgMinSize
+hasBearFVG = bearFVGSize > atr14 * i_fvgMinSize
+
+// ─────────────────────────────────────────────────────────────
+// §3  ZONE MANAGEMENT  (arrays of active zones)
+// ─────────────────────────────────────────────────────────────
+// Each zone stored as:  [zoneHigh, zoneLow, startBar, box_id_placeholder]
+// We use parallel arrays for compatibility and clarity.
+
+var float[] dZoneHigh  = array.new_float(0)
+var float[] dZoneLow   = array.new_float(0)
+var int[]   dZoneBar   = array.new_int(0)
+var box[]   dZoneBox   = array.new_box(0)
+
+var float[] sZoneHigh  = array.new_float(0)
+var float[] sZoneLow   = array.new_float(0)
+var int[]   sZoneBar   = array.new_int(0)
+var box[]   sZoneBox   = array.new_box(0)
+
+// Helper: compute buffer
+zoneBuffer(rangeSize) => rangeSize * (i_zoneBuffer / 100.0)
+
+// ── 3a  Create Demand Zone ──
+// Triggered on Bullish BOS + FVG confirmation
+// The zone is the LAST BEARISH candle before the displacement move
+// i.e., the candle at bar index [1] relative to the displacement start
+// We look back: find the most recent red (bearish) candle before this BOS bar
+
+createDemandZone() =>
+    // Walk back to find last bearish candle before displacement
+    zHigh = float(na)
+    zLow  = float(na)
+    for i = 1 to 5
+        if close[i] < open[i]   // bearish candle
+            zHigh := high[i]
+            zLow  := low[i]
+            break
+    [zHigh, zLow]
+
+// ── 3b  Create Supply Zone ──
+createSupplyZone() =>
+    zHigh = float(na)
+    zLow  = float(na)
+    for i = 1 to 5
+        if close[i] > open[i]   // bullish candle
+            zHigh := high[i]
+            zLow  := low[i]
+            break
+    [zHigh, zLow]
+
+// ── 3c  Add zones on confirmed BOS bars ──
+if barstate.isconfirmed
+    // Demand zone creation
+    if bullBOS and hasBullFVG
+        [zh, zl] = createDemandZone()
+        if not na(zh) and not na(zl)
+            buf = zoneBuffer(zh - zl)
+            zh  := zh + buf
+            zl  := zl - buf
+            // Cap max active zones
+            if array.size(dZoneHigh) >= i_maxZones
+                oldBox = array.shift(dZoneBox)
+                box.delete(oldBox)
+                array.shift(dZoneHigh)
+                array.shift(dZoneLow)
+                array.shift(dZoneBar)
+            array.push(dZoneHigh, zh)
+            array.push(dZoneLow,  zl)
+            array.push(dZoneBar,  bar_index)
+            var box newBox = na
+            if i_showDemand
+                newBox := box.new(bar_index - i_swingLen, zh, bar_index + 1, zl,
+                     border_color = color.new(#00C4FF, 30),
+                     bgcolor      = i_demandColor,
+                     border_width = 1,
+                     extend       = extend.right)
+            else
+                newBox := box.new(0, 0, 1, 0,
+                     bgcolor      = color.new(color.white, 100),
+                     border_color = color.new(color.white, 100))
+            array.push(dZoneBox, newBox)
+
+    // Supply zone creation
+    if bearBOS and hasBearFVG
+        [zh, zl] = createSupplyZone()
+        if not na(zh) and not na(zl)
+            buf = zoneBuffer(zh - zl)
+            zh  := zh + buf
+            zl  := zl - buf
+            if array.size(sZoneHigh) >= i_maxZones
+                oldBox = array.shift(sZoneBox)
+                box.delete(oldBox)
+                array.shift(sZoneHigh)
+                array.shift(sZoneLow)
+                array.shift(sZoneBar)
+            array.push(sZoneHigh, zh)
+            array.push(sZoneLow,  zl)
+            array.push(sZoneBar,  bar_index)
+            var box newBox = na
+            if i_showSupply
+                newBox := box.new(bar_index - i_swingLen, zh, bar_index + 1, zl,
+                     border_color = color.new(#FF3B6B, 30),
+                     bgcolor      = i_supplyColor,
+                     border_width = 1,
+                     extend       = extend.right)
+            else
+                newBox := box.new(0, 0, 1, 0,
+                     bgcolor      = color.new(color.white, 100),
+                     border_color = color.new(color.white, 100))
+            array.push(sZoneBox, newBox)
+
+// ── 3d  Mitigate zones when price closes fully through them ──
+if barstate.isconfirmed
+    // Check demand zones for mitigation (price closes below zone low)
+    i = 0
+    while i < array.size(dZoneHigh)
+        if close < array.get(dZoneLow, i)
+            box.delete(array.get(dZoneBox, i))
+            array.remove(dZoneHigh, i)
+            array.remove(dZoneLow,  i)
+            array.remove(dZoneBar,  i)
+            array.remove(dZoneBox,  i)
+        else
+            i += 1
+
+    // Check supply zones for mitigation (price closes above zone high)
+    j = 0
+    while j < array.size(sZoneHigh)
+        if close > array.get(sZoneHigh, j)
+            box.delete(array.get(sZoneBox, j))
+            array.remove(sZoneHigh, j)
+            array.remove(sZoneLow,  j)
+            array.remove(sZoneBar,  j)
+            array.remove(sZoneBox,  j)
+        else
+            j += 1
+
+// ─────────────────────────────────────────────────────────────
+// §4  FLUSH MECHANICS  (Liquidity Sweep Detection)
+// ─────────────────────────────────────────────────────────────
+// Flush candle properties (computed on confirmed bars only)
+candleRange = high - low
+
+// Bullish Flush:
+//   • Wick below zone low (low < zoneLow)
+//   • Body closes ABOVE zone low (close > zoneLow)
+//   • Lower wick >= minWickRatio × candleRange
+lowerWick = math.min(open, close) - low
+upperWick = high - math.max(open, close)
+
+isBullFlushCandle(zLow) =>
+    lowerWick >= i_flushWick * candleRange and    low < zLow and    close > zLow
+
+// Bearish Flush:
+//   • Wick above zone high (high > zoneHigh)
+//   • Body closes BELOW zone high (close < zoneHigh)
+//   • Upper wick >= minWickRatio × candleRange
+isBearFlushCandle(zHigh) =>
+    upperWick >= i_flushWick * candleRange and    high > zHigh and    close < zHigh
+
+// State variables for pending flush signals
+var bool   pendingLong      = false
+var bool   pendingShort     = false
+var int    flushBar         = na
+var float  longFlushLow     = na   // for SL
+var float  shortFlushHigh   = na   // for SL
+var float  longZoneLow      = na
+var float  longZoneHigh     = na
+var float  shortZoneHigh    = na
+var float  shortZoneLow     = na
+
+if barstate.isconfirmed
+    // ── Scan demand zones for Bullish Flush ──
+    if array.size(dZoneHigh) > 0
+        for k = 0 to array.size(dZoneHigh) - 1
+            zh = array.get(dZoneHigh, k)
+            zl = array.get(dZoneLow,  k)
+            if isBullFlushCandle(zl) and not pendingLong
+                pendingLong    := true
+                flushBar       := bar_index
+                longFlushLow   := low        // SL reference
+                longZoneLow    := zl
+                longZoneHigh   := zh
+                break
+
+    // ── Scan supply zones for Bearish Flush ──
+    if array.size(sZoneHigh) > 0
+        for k = 0 to array.size(sZoneHigh) - 1
+            zh = array.get(sZoneHigh, k)
+            zl = array.get(sZoneLow,  k)
+            if isBearFlushCandle(zh) and not pendingShort
+                pendingShort     := true
+                flushBar         := bar_index
+                shortFlushHigh   := high     // SL reference
+                shortZoneHigh    := zh
+                shortZoneLow     := zl
+                break
+
+    // Also detect flush at swing highs/lows (even without active zone)
+    if not na(lastSwingLow) and isBullFlushCandle(lastSwingLow) and not pendingLong
+        pendingLong    := true
+        flushBar       := bar_index
+        longFlushLow   := low
+        longZoneLow    := lastSwingLow
+        longZoneHigh   := lastSwingLow + atr14 * 0.5
+
+    if not na(lastSwingHigh) and isBearFlushCandle(lastSwingHigh) and not pendingShort
+        pendingShort     := true
+        flushBar         := bar_index
+        shortFlushHigh   := high
+        shortZoneHigh    := lastSwingHigh
+        shortZoneLow     := lastSwingHigh - atr14 * 0.5
+
+// ─────────────────────────────────────────────────────────────
+// §5  ENTRY CONFIRMATION  (No-repaint, barstate.isconfirmed)
+// ─────────────────────────────────────────────────────────────
+// Engulfing check: current candle body engulfs prior candle body
+bodySize     = math.abs(close - open)
+prevBodySize = math.abs(close[1] - open[1])
+
+isBullEngulf = close > open and                            // current is bullish
+               close > open[1] and                         // closes above prior open
+               open  < close[1] and                        // opens below prior close
+               bodySize >= prevBodySize * i_engulfFactor   // body size check
+
+isBearEngulf = close < open and                            // current is bearish
+               close < open[1] and                         // closes below prior open
+               open  > close[1] and                        // opens above prior close
+               bodySize >= prevBodySize * i_engulfFactor
+
+// Momentum alternative: strong directional close
+isBullMomentum = close > open and bodySize > atr14 * 0.4 and close > high[1]
+isBearMomentum = close < open and bodySize > atr14 * 0.4 and close < low[1]
+
+longConfirmed  = pendingLong  and (isBullEngulf or isBullMomentum) and
+                 (bar_index - flushBar) <= i_confirmBars and
+                 barstate.isconfirmed
+
+shortConfirmed = pendingShort and (isBearEngulf or isBearMomentum) and
+                 (bar_index - flushBar) <= i_confirmBars and
+                 barstate.isconfirmed
+
+// Expire pending signals if window passes
+if barstate.isconfirmed
+    if pendingLong  and (bar_index - flushBar) > i_confirmBars
+        pendingLong := false
+    if pendingShort and (bar_index - flushBar) > i_confirmBars
+        pendingShort := false
+
+// ─────────────────────────────────────────────────────────────
+// §6  RISK MANAGEMENT LEVELS
+// ─────────────────────────────────────────────────────────────
+// Long trade levels
+longEntry = close
+longSL    = longFlushLow - (atr14 * 0.1)   // tiny buffer below flush wick
+longRisk  = longEntry - longSL
+longTP    = longEntry + longRisk * i_rrRatio
+
+// Short trade levels
+shortEntry = close
+shortSL    = shortFlushHigh + (atr14 * 0.1)
+shortRisk  = shortSL - shortEntry
+shortTP    = shortEntry - shortRisk * i_rrRatio
+
+// Find nearest opposing zone for dynamic TP
+nearestSupplyForTP() =>
+    result = float(na)
+    if array.size(sZoneLow) > 0
+        for k = 0 to array.size(sZoneLow) - 1
+            lvl = array.get(sZoneLow, k)
+            if lvl > longEntry
+                result := na(result) ? lvl : math.min(result, lvl)
+    result
+
+nearestDemandForTP() =>
+    result = float(na)
+    if array.size(dZoneHigh) > 0
+        for k = 0 to array.size(dZoneHigh) - 1
+            lvl = array.get(dZoneHigh, k)
+            if lvl < shortEntry
+                result := na(result) ? lvl : math.max(result, lvl)
+    result
+
+// ─────────────────────────────────────────────────────────────
+// §7  PLOTTING SIGNALS
+// ─────────────────────────────────────────────────────────────
+// ── Entry Labels ──
+if longConfirmed
+    label.new(bar_index, low - atr14 * 0.8,
+              "▲ LONG",
+              style    = label.style_label_up,
+              color    = color.new(#00C4FF, 10),
+              textcolor= color.white,
+              size     = size.normal)
+    pendingLong := false
+
+if shortConfirmed
+    label.new(bar_index, high + atr14 * 0.8,
+              "▼ SHORT",
+              style    = label.style_label_down,
+              color    = color.new(#FF3B6B, 10),
+              textcolor= color.white,
+              size     = size.normal)
+    pendingShort := false
+
+// ── SL / TP Lines on confirmed entry ──
+if longConfirmed and i_showSL
+    line.new(bar_index, longSL, bar_index + 20, longSL,
+             color=color.new(color.red, 20), width=1, style=line.style_dashed)
+    label.new(bar_index + 10, longSL, "SL",
+              style=label.style_none, textcolor=color.red, size=size.small)
+
+if longConfirmed and i_showTP
+    tpLevel = i_useOppZone ? nearestSupplyForTP() : longTP
+    if not na(tpLevel)
+        line.new(bar_index, tpLevel, bar_index + 20, tpLevel,
+                 color=color.new(color.green, 20), width=1, style=line.style_dashed)
+        label.new(bar_index + 10, tpLevel, "TP " + str.tostring(i_rrRatio, "#.#") + "R",
+                  style=label.style_none, textcolor=color.green, size=size.small)
+
+if shortConfirmed and i_showSL
+    line.new(bar_index, shortSL, bar_index + 20, shortSL,
+             color=color.new(color.red, 20), width=1, style=line.style_dashed)
+    label.new(bar_index + 10, shortSL, "SL",
+              style=label.style_none, textcolor=color.red, size=size.small)
+
+if shortConfirmed and i_showTP
+    tpLevel = i_useOppZone ? nearestDemandForTP() : shortTP
+    if not na(tpLevel)
+        line.new(bar_index, tpLevel, bar_index + 20, tpLevel,
+                 color=color.new(color.green, 20), width=1, style=line.style_dashed)
+        label.new(bar_index + 10, tpLevel, "TP " + str.tostring(i_rrRatio, "#.#") + "R",
+                  style=label.style_none, textcolor=color.green, size=size.small)
+
+// ── Swing High / Low markers ──
+plotshape(swingHigh, title="Swing High", location=location.abovebar,
+          style=shape.triangledown, color=color.new(#FF3B6B, 50), size=size.tiny)
+plotshape(swingLow,  title="Swing Low",  location=location.belowbar,
+          style=shape.triangleup,   color=color.new(#00C4FF, 50), size=size.tiny)
+
+// ── BOS markers ──
+plotshape(bullBOS and barstate.isconfirmed, title="Bull BOS",
+          location=location.belowbar, style=shape.labelup,
+          color=color.new(#00FF88, 60), textcolor=color.white,
+          text="BOS", size=size.tiny)
+plotshape(bearBOS and barstate.isconfirmed, title="Bear BOS",
+          location=location.abovebar, style=shape.labeldown,
+          color=color.new(#FF3B6B, 60), textcolor=color.white,
+          text="BOS", size=size.tiny)
+
+// ── FVG Highlight (optional) ──
+var box fvgBox = na
+if i_showFVG and barstate.isconfirmed
+    if hasBullFVG
+        fvgBox := box.new(bar_index - 2, low, bar_index, high[2],
+                          bgcolor=color.new(#00FF88, 88),
+                          border_color=color.new(#00FF88, 60))
+    if hasBearFVG
+        fvgBox := box.new(bar_index - 2, low[2], bar_index, high,
+                          bgcolor=color.new(#FF3B6B, 88),
+                          border_color=color.new(#FF3B6B, 60))
+
+// ── Flush candle highlight ──
+// Mark the flush candle with a subtle background colour
+bgcolor(pendingLong  and barstate.isconfirmed ? color.new(#00C4FF, 92) : na, title="Pending Long Flush BG")
+bgcolor(pendingShort and barstate.isconfirmed ? color.new(#FF3B6B, 92) : na, title="Pending Short Flush BG")
+
+// ─────────────────────────────────────────────────────────────
+// §8  ALERT CONDITIONS
+// ─────────────────────────────────────────────────────────────
+alertcondition(longConfirmed,
+               title  = "ICT SMC — LONG Entry",
+               message= "ICT SMC: Bullish Flush confirmed → LONG entry at {{close}}. SL below flush wick.")
+
+alertcondition(shortConfirmed,
+               title  = "ICT SMC — SHORT Entry",
+               message= "ICT SMC: Bearish Flush confirmed → SHORT entry at {{close}}. SL above flush wick.")
+
+alertcondition(bullBOS and barstate.isconfirmed,
+               title  = "ICT SMC — Bullish BOS",
+               message= "ICT SMC: Bullish Break of Structure detected on {{ticker}} — Demand zone created.")
+
+alertcondition(bearBOS and barstate.isconfirmed,
+               title  = "ICT SMC — Bearish BOS",
+               message= "ICT SMC: Bearish Break of Structure detected on {{ticker}} — Supply zone created.")
+
+// ─────────────────────────────────────────────────────────────
+// §9  TABLE — Live Stats Dashboard
+// ─────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 7,                            bgcolor     = color.new(#0D1117, 10),                           border_color= color.new(#30363D, 80),                            border_width = 1,                            frame_color = color.new(#30363D, 60),                            frame_width = 1)
+
+if barstate.islast
+    hdr = color.new(#161B22, 20)
+    txt = color.white
+    dim = color.new(#8B949E, 0)
+
+    table.cell(dash, 0, 0, "ICT · SMC FLOW", text_color=#00C4FF, bgcolor=hdr, text_size=size.small)
+    table.cell(dash, 1, 0, "v5", text_color=dim, bgcolor=hdr, text_size=size.small)
+
+    table.cell(dash, 0, 1, "Swing Len",     text_color=dim,  bgcolor=hdr, text_size=size.small)
+    table.cell(dash, 1, 1, str.tostring(i_swingLen), text_color=txt, bgcolor=hdr, text_size=size.small)
+
+    table.cell(dash, 0, 2, "Active Demand", text_color=#00C4FF, bgcolor=hdr, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(array.size(dZoneHigh)), text_color=txt, bgcolor=hdr, text_size=size.small)
+
+    table.cell(dash, 0, 3, "Active Supply", text_color=#FF3B6B, bgcolor=hdr, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(array.size(sZoneHigh)), text_color=txt, bgcolor=hdr, text_size=size.small)
+
+    table.cell(dash, 0, 4, "RR Ratio",      text_color=dim,  bgcolor=hdr, text_size=size.small)
+    table.cell(dash, 1, 4, "1:" + str.tostring(i_rrRatio, "#.#"), text_color=txt, bgcolor=hdr, text_size=size.small)
+
+    table.cell(dash, 0, 5, "Pending Long",  text_color=#00C4FF, bgcolor=hdr, text_size=size.small)
+    table.cell(dash, 1, 5, pendingLong ? "YES ●" : "—", text_color= pendingLong ? #00FF88 : dim, bgcolor=hdr, text_size=size.small)
+
+    table.cell(dash, 0, 6, "Pending Short", text_color=#FF3B6B, bgcolor=hdr, text_size=size.small)
+    table.cell(dash, 1, 6, pendingShort ? "YES ●" : "—", text_color= pendingShort ? #FF3B6B : dim, bgcolor=hdr, text_size=size.small)
